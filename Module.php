@@ -1,6 +1,6 @@
 <?php
 
-namespace app\modules\DemonTasker;
+namespace app\modules\Yii2DemonTasker;
 
 /**
  * DemonTasker module definition class
@@ -18,7 +18,7 @@ class Module extends \yii\base\Module
     /**
      * {@inheritdoc}
      */
-    public $controllerNamespace = 'app\modules\DemonTasker\controllers';
+    public $controllerNamespace = 'app\modules\Yii2DemonTasker\controllers';
 
     /**
      * {@inheritdoc}
@@ -28,7 +28,7 @@ class Module extends \yii\base\Module
         parent::init();
 
         if (\Yii::$app instanceof \yii\console\Application) {
-            $this->controllerNamespace = 'app\modules\DemonTasker\commands\controllers';
+            $this->controllerNamespace = 'app\modules\Yii2DemonTasker\commands\controllers';
         }
     }
 }

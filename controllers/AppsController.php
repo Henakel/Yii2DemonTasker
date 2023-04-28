@@ -1,6 +1,6 @@
 <?php
 
-namespace app\modules\DemonTasker\controllers;
+namespace app\modules\Yii2DemonTasker\controllers;
 
 use yii\web\Controller;
 
