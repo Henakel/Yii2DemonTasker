@@ -2,23 +2,26 @@
 
 namespace app\commands\controllers;
 
+use app\modules\Yii2DemonTasker\models\DemonsRuntime;
+use app\modules\Yii2DemonTasker\models\DemonsState;
+use yii\base\Exception;
 use yii\base\NotSupportedException;
 use yii\console\Controller;
+use yii\db\ActiveQuery;
+use yii\db\ActiveRecord;
+use yii\db\Expression;
+use yii\helpers\ArrayHelper;
 use yii\helpers\Console;
 
-/**
- * Class DaemonController
- *
- * @author Vladimir Yants <vladimir.yants@gmail.com>
- */
+
 abstract class DaemonController extends Controller
 {
 
     const EVENT_BEFORE_JOB = "EVENT_BEFORE_JOB";
-    const EVENT_AFTER_JOB = "EVENT_AFTER_JOB";
+    const EVENT_AFTER_JOB  = "EVENT_AFTER_JOB";
 
     const EVENT_BEFORE_ITERATION = "event_before_iteration";
-    const EVENT_AFTER_ITERATION = "event_after_iteration";
+    const EVENT_AFTER_ITERATION  = "event_after_iteration";
 
     /**
      * @var $demonize boolean Run controller as Daemon
@@ -33,10 +36,9 @@ abstract class DaemonController extends Controller
      */
     public $isMultiInstance = false;
 
-    /**
-     * @var $parentPID int main procces pid
-     */
-    protected $parentPID;
+    public $unitName    = '';
+    public $unitList    = [];
+    public $unitRunTime = [];
 
     /**
      * @var $maxChildProcesses int max daemon instances
@@ -48,6 +50,8 @@ abstract class DaemonController extends Controller
      * @var $currentJobs [] array of running instances
      */
     protected static $currentJobs = [];
+    protected        $mainPid;
+    protected        $childPid;
 
     /**
      * @var int Memory limit for daemon, must bee less than php memory_limit
@@ -70,6 +74,7 @@ abstract class DaemonController extends Controller
     protected $logDir = "@runtime/daemons/logs";
 
     private $shortName = '';
+
 
     /**
      * Init function
@@ -130,9 +135,11 @@ abstract class DaemonController extends Controller
             $pid = pcntl_fork();
             if ($pid == -1) {
                 $this->halt(self::EXIT_CODE_ERROR, 'pcntl_fork() rise error');
-            } elseif ($pid) {
+            }
+            elseif ($pid) {
                 $this->halt(self::EXIT_CODE_NORMAL);
-            } else {
+            }
+            else {
                 posix_setsid();
                 //close std streams (unlink console)
                 if (is_resource(STDIN)) {
@@ -152,10 +159,12 @@ abstract class DaemonController extends Controller
         //rename process
         if (version_compare(PHP_VERSION, '5.5.0') >= 0) {
             cli_set_process_title($this->getProcessName());
-        } else {
+        }
+        else {
             if (function_exists('setproctitle')) {
                 setproctitle($this->getProcessName());
-            } else {
+            }
+            else {
                 throw new NotSupportedException(
                     "Can't find cli_set_process_title or setproctitle function"
                 );
@@ -187,7 +196,8 @@ abstract class DaemonController extends Controller
                 );
             }
             return true;
-        } else {
+        }
+        else {
             return false;
         }
     }
@@ -227,6 +237,20 @@ abstract class DaemonController extends Controller
         return array_shift($jobs);
     }
 
+    private function changeState(&$state, $fields)
+    {
+        /* @var $state \yii\db\ActiveRecord */
+        foreach ($fields as $key => $val) {
+            $state->$key = $val;
+        }
+        $state->memory_use = memory_get_usage();
+
+        $state->save();
+
+        if (!empty($state->errors))
+            throw new \Exception('Ошибка изменения состояния:' . var_export($state->errors, true));
+    }
+
     /**
      * Main iterator
      *
@@ -234,64 +258,61 @@ abstract class DaemonController extends Controller
      */
     final private function loop()
     {
-        if (file_put_contents($this->getPidPath(), getmypid())) {
-            $this->parentPID = getmypid();
-            \Yii::info('Daemon ' . $this->shortName . ' pid ' . getmypid() . ' started.');
-            while (!self::$stopFlag && (memory_get_usage() < $this->memoryLimit)) {
+        $this->mainPid = getmypid();
 
-                file_put_contents($this->getPidPath(), getmypid());
+        $state = $this->getStateFromName($this->getProcessName());
+        $this->changeState($state, [
+            'pid' => $this->mainPid,
+            'run' => true,
+            'date_run' => new Expression('NOW()'),
+        ]);
 
-                $this->trigger(self::EVENT_BEFORE_ITERATION);
-                $this->renewConnections();
-                $jobs = $this->defineJobs();
+        \Yii::info('Daemon ' . $this->shortName . ' pid ' . $this->mainPid . ' started.');
+        while ($state->active && (memory_get_usage() < $this->memoryLimit)) {
 
-                if ($jobs && count($jobs)) {
-                    while (($job = $this->defineJobExtractor($jobs)) !== null) {
-                        //if no free workers, wait
+            $this->mainPid = getmypid();
+            $this->changeState($state, ['pid' => $this->mainPid]);
 
-                        $start = microtime();
+            $this->trigger(self::EVENT_BEFORE_ITERATION);
+            $this->renewConnections();
+            $jobs = $this->defineJobs();
 
-                        file_put_contents($this->getPidPath() . '_jobs', var_export(static::$currentJobs, true));
-
-                        if (count(static::$currentJobs) >= $this->maxChildProcesses) {
-                            \Yii::info('Reached maximum number of child processes. Waiting...');
-                            while (count(static::$currentJobs) >= $this->maxChildProcesses) {
-                                sleep(1);
-                                pcntl_signal_dispatch();
-                            }
-                            \Yii::info(
-                                'Free workers found: ' .
-                                ($this->maxChildProcesses - count(static::$currentJobs)) .
-                                ' worker(s). Delegate tasks.'
-                            );
+            if ($jobs && count($jobs)) {
+                while (($job = $this->defineJobExtractor($jobs)) !== null) {
+                    if (count(static::$currentJobs) >= $this->maxChildProcesses) {
+                        \Yii::info('Reached maximum number of child processes. Waiting...');
+                        while (count(static::$currentJobs) >= $this->maxChildProcesses) {
+                            sleep(1);
+                            pcntl_signal_dispatch();
                         }
-                        pcntl_signal_dispatch();
-                        $this->runDaemon($job);
+                        \Yii::info(
+                            'Free workers found: ' .
+                            ($this->maxChildProcesses - count(static::$currentJobs)) .
+                            ' worker(s). Delegate tasks.'
+                        );
                     }
-                } else {
-                    usleep($this->sleep);
+                    pcntl_signal_dispatch();
+                    $this->runDaemon($job);
                 }
-                pcntl_signal_dispatch();
-                $this->trigger(self::EVENT_AFTER_ITERATION);
             }
-            if (memory_get_usage() > $this->memoryLimit) {
-                \Yii::info('Daemon ' . $this->shortName . ' pid ' .
-                    getmypid() . ' used ' . memory_get_usage() . ' bytes on ' . $this->memoryLimit .
-                    ' bytes allowed by memory limit');
+            else {
+                usleep($this->sleep);
             }
-
-            \Yii::info('Daemon ' . $this->shortClassName() . ' pid ' . getmypid() . ' is stopped.');
-
-            if (file_exists($this->getPidPath())) {
-                @unlink($this->getPidPath());
-            } else {
-                \Yii::error('Can\'t unlink pid file ' . $this->getPidPath());
-            }
-
-            return self::EXIT_CODE_NORMAL;
+            pcntl_signal_dispatch();
+            $this->trigger(self::EVENT_AFTER_ITERATION);
+            $state->refresh();
         }
-        $this->halt(self::EXIT_CODE_ERROR, 'Can\'t create pid file ' . $this->getPidPath());
-        return self::EXIT_CODE_ERROR;
+
+        if (memory_get_usage() > $this->memoryLimit) {
+            \Yii::info('Daemon ' . $this->shortName . ' pid ' .
+                getmypid() . ' used ' . memory_get_usage() . ' bytes on ' . $this->memoryLimit .
+                ' bytes allowed by memory limit');
+        }
+
+        \Yii::info('Daemon ' . $this->shortClassName() . ' pid ' . getmypid() . ' is stopped.');
+        $this->changeState($state, ['pid' => getmypid(), 'run' => false]);
+
+        return self::EXIT_CODE_NORMAL;
     }
 
     /**
@@ -355,23 +376,30 @@ abstract class DaemonController extends Controller
             $pid = pcntl_fork();
             if ($pid == -1) {
                 return false;
-            } elseif ($pid) {
+            }
+            elseif ($pid) {
                 static::$currentJobs[$pid] = microtime(true);
-            } else {
+                $this->childPid = $pid;
+            }
+            else {
                 $this->renewConnections();
                 //child process must die
                 $this->trigger(self::EVENT_BEFORE_JOB);
                 if ($this->doJob($job)) {
                     $this->trigger(self::EVENT_AFTER_JOB);
                     $this->halt(self::EXIT_CODE_NORMAL);
-                } else {
+                }
+                else {
                     $this->trigger(self::EVENT_AFTER_JOB);
                     $this->halt(self::EXIT_CODE_ERROR, 'Child process #' . $pid . ' return error.');
                 }
             }
 
             return true;
-        } else {
+        }
+        else {
+            $this->childPid = $this->mainPid;
+
             $this->trigger(self::EVENT_BEFORE_JOB);
             $status = $this->doJob($job);
             $this->trigger(self::EVENT_AFTER_JOB);
@@ -394,7 +422,8 @@ abstract class DaemonController extends Controller
                 if (!$this->demonize) {
                     $message = Console::ansiFormat($message, [Console::FG_RED]);
                 }
-            } else {
+            }
+            else {
                 \Yii::info($message);
             }
             if (!$this->demonize) {
@@ -454,5 +483,26 @@ abstract class DaemonController extends Controller
         }
         return $dir . DIRECTORY_SEPARATOR . $this->shortName;
     }
+
+
+    public function getStateFromName($name)
+    {
+        $pid = DemonsState::find()->pidFromName($name)->one();
+        if (empty($pid))
+            throw new \Exception('Ошибка поиска состояния основного процесса:' . $name);
+        else
+            return $pid;
+    }
+
+
+    public function loadUnits(ActiveQuery $query)
+    {
+        $this->unitList = $query->all();
+        $this->unitRunTime = DemonsRuntime::find()->where([
+            'unit' => $this->unitName,
+            'unit_id' => ArrayHelper::getColumn($this->listUnits, 'id')
+        ])->all();
+    }
+
 
 }
